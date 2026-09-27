@@ -65,6 +65,7 @@ def vendor(key, today):
             "website": "nimbuscrm.io", "hq": "Ireland",
             "category": "Marketing / CRM", "spend": "$50k – $250k",
             "description": "CRM platform for the global sales pipeline.",
+            "product": "NimbusCRM Sales Cloud",
             "bu": "Sales & Marketing", "owner": "Head of Sales Ops",
             "contract_start": _days(today, -540),
             "contract_end": _days(today, 75),
@@ -86,6 +87,7 @@ def vendor(key, today):
             "website": "paybridge.co", "hq": "United States",
             "category": "Payment processor", "spend": "> $250k",
             "description": "Processes outbound vendor and payroll payments.",
+            "product": "PayBridge Payouts",
             "bu": "Finance", "owner": "",
             "contract_start": _days(today, -900),
             "contract_end": _days(today, 40),
@@ -107,6 +109,7 @@ def vendor(key, today):
         "category": "Hardware & equipment", "spend": "< $10k",
         "description": "Office hardware and peripherals. No system or data "
                        "access.",
+        "product": "Office hardware supply",
         "bu": "Procurement", "owner": "Procurement Lead",
         "contract_start": _days(today, -300),
         "contract_end": _days(today, 400),
@@ -135,7 +138,37 @@ def paybridge_report(today):
         "cuecs_present": True,
         "cuecs_summary": "Customers must restrict and review API key access.",
         "subservice_method": "Inclusive",
+        # the same structures pdfintel produces, without page citations
+        "_exceptions": [{"control": "CC8.1", "sample": "4 of 40", "page": None,
+                         "text": "Change approvals missing for 4 of 40 "
+                                 "sampled production releases."}],
+        "_cuecs": [{"text": "Customers must restrict and review API key "
+                            "access.", "page": None}],
+        "_subservice": [{"name": "Stripe", "type": "Payments", "page": None,
+                         "method": "Inclusive"}],
+        "_cites": {}, "_queue": [],
     }
+
+
+# Reviewer decisions pre-filled for the tour: some done, some still open,
+# so the dashboard shows both states.
+REVIEW_PREFILL = {
+    "nimbus": {
+        "rv_cuec_owner_0": "IT Security (Okta team)",
+        "rv_cuec_status_0": "Implemented",
+        "rv_cuec_owner_1": "",
+        "rv_cuec_status_1": "Not assessed",
+        "rv_cuec_owner_2": "HR Operations",
+        "rv_cuec_status_2": "In progress",
+        "rv_cuec_owner_3": "",
+        "rv_cuec_status_3": "Not assessed",
+        "rv_sub_ev_0": "Received: SOC 2",
+        "rv_sub_ev_1": "Not requested",
+        "rv_exc_dec_0": "Accept with compensating control",
+        "rv_exc_note_0": "Automated deprovisioning since Q1 2026 — confirm in "
+                         "the next report period.",
+    },
+}
 
 
 # What to look at on each wizard step during the tour.
@@ -161,7 +194,11 @@ TOUR = {
         "answered No become High findings; watch <b>Live control "
         "maturity</b> on the right."),
     5: ("Evidence & contracts",
-        "{evidence_note} {contracts_note} The tour uses fixed synthetic data "
+        "{evidence_note} Open the review tabs below the report card: the "
+        "<b>Reviewer summary</b> cites the page and sentence behind every "
+        "value, <b>CUECs</b>, <b>Subservice orgs</b> and <b>Exceptions</b> "
+        "each get an owner or decision, and <b>Document triage</b> shows the "
+        "file's SHA-256. {contracts_note} The tour uses fixed synthetic data "
         "(no AI call) so the result is repeatable."),
     6: ("Dashboard",
         "Read it top-down: <b>Residual Risk</b> (the answer) → <b>Maturity "

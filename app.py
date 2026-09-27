@@ -25,12 +25,15 @@ import re
 import json
 import math
 import base64
+import io
+import zipfile
 import datetime as dt
 
 import streamlit as st
 
 import contracts as ct
 import demo
+import pdfintel as pi
 import questionnaire as qn
 
 # ----------------------------------------------------------------------
@@ -140,38 +143,6 @@ PRIVACY_REGS = {"GDPR", "DPDP Act (India)", "CCPA / CPRA", "HIPAA"}
 SENSITIVE = {"Customer PII", "Employee PII", "Health / PHI",
              "Financial / cardholder", "Authentication / credentials"}
 
-# ----------------------------------------------------------------------
-# Synthetic sample SOC 2 (for the "Load sample" button)
-# ----------------------------------------------------------------------
-SAMPLE_SOC2 = """INDEPENDENT SERVICE AUDITOR'S REPORT
-
-Report of NimbusCRM Cloud, Inc. relevant to Security, Availability and
-Confidentiality throughout the period October 1, 2025 to March 31, 2026
-(SOC 2 Type 2).
-
-Scope. We have examined NimbusCRM Cloud's description of its CRM platform
-system and the suitability of the design and operating effectiveness of
-controls to meet the criteria for the Security, Availability and
-Confidentiality categories set forth in TSP section 100, Trust Services
-Criteria.
-
-Opinion. In our opinion, in all material respects, the controls were suitably
-designed and operated effectively throughout the specified period (unqualified
-opinion), based on the applicable trust services criteria.
-
-Exceptions. One exception was noted: for two of twenty-five sampled
-terminations, access was not revoked within the one business day required by
-policy (relates to CC6). Management remediated the control in Q1 2026.
-
-Subservice organizations. NimbusCRM Cloud uses AWS as a subservice
-organization and applies the carve-out method. Complementary User Entity
-Controls (CUECs) are described in Section 5 and are the responsibility of
-user entities, including enforcement of MFA and timely user access reviews.
-
-Privacy and Processing Integrity categories were not in scope for this
-examination.
-"""
-
 NO_REPORT = {
     "report_type": "None", "period_start": None, "period_end": None,
     "tsc_categories": [], "auditor_opinion": "N/A",
@@ -180,13 +151,13 @@ NO_REPORT = {
     "subservice_method": "Unknown", "_method": "questionnaire only"}
 
 # ----------------------------------------------------------------------
-# Extraction: AI first, rule-based fallback
+# Extraction: page-cited rules first, AI as a cross-check (pdfintel.py)
 # ----------------------------------------------------------------------
-EXTRACT_PROMPT = """You are a SOC 2 analyst. Read the report text and return ONLY a JSON object, no prose, with these keys:
+EXTRACT_PROMPT = """You are a SOC 2 analyst. The text below contains the relevant pages of a SOC report, each marked [Page N]. Return ONLY a JSON object, no prose, with these keys:
 report_type: one of "SOC 2 Type II","SOC 2 Type I","SOC 3","Unknown"
 period_start: YYYY-MM-DD or null
 period_end: YYYY-MM-DD or null
-tsc_categories: array from ["Security","Availability","Confidentiality","Processing Integrity","Privacy"]
+tsc_categories: array from ["Security","Availability","Confidentiality","Processing Integrity","Privacy"] (only categories actually examined)
 auditor_opinion: one of "Unqualified","Qualified","Adverse","Disclaimer","Unknown"
 exceptions_noted: true or false
 exceptions_summary: short string or null
@@ -194,93 +165,8 @@ cuecs_present: true or false
 cuecs_summary: short string or null
 subservice_method: one of "Carve-out","Inclusive","Unknown"
 
-REPORT TEXT:
+REPORT PAGES:
 """
-
-
-def _month_to_num(m):
-    months = ["jan", "feb", "mar", "apr", "may", "jun",
-              "jul", "aug", "sep", "oct", "nov", "dec"]
-    m = m.lower()[:3]
-    return months.index(m) + 1 if m in months else None
-
-
-def _find_dates(text):
-    """Best-effort period extraction, e.g. 'October 1, 2025 to March 31, 2026'."""
-    pat = r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})"
-    found = re.findall(pat, text)
-    dates = []
-    for mon, day, yr in found:
-        n = _month_to_num(mon)
-        if n:
-            try:
-                dates.append(dt.date(int(yr), n, int(day)))
-            except ValueError:
-                pass
-    if len(dates) >= 2:
-        return min(dates).isoformat(), max(dates).isoformat()
-    if len(dates) == 1:
-        return None, dates[0].isoformat()
-    return None, None
-
-
-def rule_extract(text):
-    # normalise whitespace so line breaks don't split key phrases
-    t = re.sub(r"\s+", " ", text.lower())
-    if "soc 3" in t or "soc3" in t:
-        rtype = "SOC 3"
-    elif "type 2" in t or "type ii" in t:
-        rtype = "SOC 2 Type II"
-    elif "type 1" in t or "type i" in t:
-        rtype = "SOC 2 Type I"
-    else:
-        rtype = "Unknown"
-
-    # categories explicitly marked out of scope should not count as covered
-    excluded = set()
-    for m in re.finditer(
-            r"([\w ,]+?)\s+(?:categories?\s+)?(?:were|was|are|is)\s+not\s+in\s+scope", t):
-        seg = m.group(1)
-        for c in ["availability", "confidentiality", "processing integrity",
-                  "privacy", "security"]:
-            if c in seg:
-                excluded.add(c)
-
-    cats = []
-    if ("security" in t or "common criteria" in t) and "security" not in excluded:
-        cats.append("Security")
-    for c in ["Availability", "Confidentiality", "Processing Integrity", "Privacy"]:
-        if c.lower() in t and c.lower() not in excluded:
-            cats.append(c)
-
-    if "unqualified" in t or "in all material respects" in t:
-        opinion = "Unqualified"
-    elif "adverse" in t:
-        opinion = "Adverse"
-    elif "disclaimer" in t:
-        opinion = "Disclaimer"
-    elif "qualified" in t:
-        opinion = "Qualified"
-    else:
-        opinion = "Unknown"
-
-    exc = ("exception" in t) or ("deviation" in t)
-    cuec = "complementary user entity control" in t  # matches singular/plural
-    if "carve-out" in t or "carve out" in t:
-        sub = "Carve-out"
-    elif "inclusive method" in t:
-        sub = "Inclusive"
-    else:
-        sub = "Unknown"
-
-    ps, pe = _find_dates(text)
-    return {
-        "report_type": rtype, "period_start": ps, "period_end": pe,
-        "tsc_categories": cats or ["Security"], "auditor_opinion": opinion,
-        "exceptions_noted": exc, "exceptions_summary": None,
-        "cuecs_present": cuec, "cuecs_summary": None,
-        "subservice_method": sub, "_method": "rule-based",
-    }
 
 
 def ai_backends():
@@ -300,7 +186,7 @@ def ai_extract(text, client_kwargs, model):
     client = InferenceClient(**client_kwargs)
     resp = client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": EXTRACT_PROMPT + text[:6000]}],
+        messages=[{"role": "user", "content": EXTRACT_PROMPT + text[:12000]}],
         max_tokens=600, temperature=0.1,
     )
     raw = resp.choices[0].message.content.strip()
@@ -330,25 +216,97 @@ def ai_error_reason(e):
     return type(e).__name__ + (" (%s)" % status if status else "")
 
 
-def extract(text):
-    reasons = []
-    for label, kwargs, model in ai_backends():
-        try:
-            data = ai_extract(text, kwargs, model)
-            data["_method"] = "AI (%s · %s)" % (label, model.split("/")[-1])
-            return data
-        except Exception as e:  # noqa: BLE001 - demo resilience
-            reasons.append("%s: %s" % (label, ai_error_reason(e)))
-    res = rule_extract(text)
-    if reasons:
-        res["_method"] = "rule-based (AI unavailable — %s)" % "; ".join(reasons)
-    return res
+REVIEW_PREFIX = "rv_"
+SAMPLE_PDF_NAME = "Synthetic SOC 2 Type 2 - NimbusCRM Cloud (10 pages).pdf"
+
+
+def reset_review(target):
+    """Forget reviewer decisions that belonged to a previous report."""
+    for k in [k for k in target if k.startswith(REVIEW_PREFIX)]:
+        del target[k]
+    for k in [k for k in st.session_state
+              if k.startswith("w_" + REVIEW_PREFIX)]:
+        del st.session_state[k]
+
+
+def register_evidence(target, doc_type, name, digest, pages=None,
+                      status="OK"):
+    """Evidence register entry: stable ID, file name, SHA-256, when."""
+    reg = target.setdefault("evidence", {})
+    order = ["SOC 2", "DPA", "MSA", "SOW"]
+    reg[doc_type] = {"id": "EV-%02d" % (order.index(doc_type) + 1
+                                        if doc_type in order else len(reg) + 1),
+                     "type": doc_type, "name": name, "sha256": digest,
+                     "pages": pages, "status": status,
+                     "loaded": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+
+def process_report(target, data, name, use_ai=True):
+    """Triage, extract with page citations, cross-check with AI and store.
+    Returns the triage info; target["extracted"] is None if unreadable."""
+    info, pages = pi.triage(data)
+    reset_review(target)
+    target["pdf"] = info
+    target["evidence_name"] = name
+    target["evidence_key"] = info["sha256"]
+    register_evidence(target, "SOC 2", name, info["sha256"], info["pages"],
+                      info["status"])
+    if not pages or info["text_pages"] == 0:
+        target["extracted"] = None
+        return info
+    ext = pi.extract(pages)
+    info["issues"] += pi.completeness(ext)
+    ai, reasons, label = None, [], None
+    if use_ai:
+        context = pi.ai_context(pages, ext)
+        for lbl, kwargs, model in ai_backends():
+            try:
+                ai = ai_extract(context, kwargs, model)
+                label = "%s · %s" % (lbl, model.split("/")[-1])
+                break
+            except Exception as e:  # noqa: BLE001 - demo resilience
+                reasons.append("%s: %s" % (lbl, ai_error_reason(e)))
+    ext = pi.merge(ext, ai)
+    if label:
+        ext["_method"] = "page-cited rules, cross-checked by AI (%s)" % label
+    elif reasons:
+        ext["_method"] = ("page-cited rules (AI cross-check unavailable — %s)"
+                          % "; ".join(reasons))
+    elif use_ai:
+        ext["_method"] = "page-cited rules (no AI key set)"
+    else:
+        ext["_method"] = "page-cited rules (tour data, no AI call)"
+    target["extracted"] = ext
+    return info
 
 
 def read_pdf(uploaded):
     from pypdf import PdfReader
     reader = PdfReader(uploaded)
     return "\n".join((p.extract_text() or "") for p in reader.pages)
+
+
+def effective_ext(a):
+    """The report as the reviewer has confirmed it: review-queue overrides
+    applied, plus the CUEC / subservice / exception decisions."""
+    ext = dict(a.get("extracted") or NO_REPORT)
+    for f in ext.get("_queue", []):
+        v = a.get(REVIEW_PREFIX + "q_" + f)
+        if v not in (None, "", []):
+            ext[f] = v
+    ext["_cuec_state"] = [
+        {"owner": a.get("%scuec_owner_%d" % (REVIEW_PREFIX, i), ""),
+         "status": a.get("%scuec_status_%d" % (REVIEW_PREFIX, i),
+                         "Not assessed")}
+        for i in range(len(ext.get("_cuecs", [])))]
+    ext["_sub_state"] = [a.get("%ssub_ev_%d" % (REVIEW_PREFIX, i),
+                               "Not requested")
+                         for i in range(len(ext.get("_subservice", [])))]
+    ext["_exc_state"] = [
+        {"decision": a.get("%sexc_dec_%d" % (REVIEW_PREFIX, i), "Undecided"),
+         "note": a.get("%sexc_note_%d" % (REVIEW_PREFIX, i), "")}
+        for i in range(len(ext.get("_exceptions", [])))]
+    return ext
 
 
 # ----------------------------------------------------------------------
@@ -535,7 +493,16 @@ def report_maturity(required, ext, rta="No", tier=3, q=None):
             adj.append(("%s not covered (self-attested %d%%)" % (c, pct), -6))
         else:
             adj.append(("%s not covered" % c, -12))
-    if ext["cuecs_present"]:
+    # CUECs: controls *we* must operate. With the CUEC list extracted, only
+    # unconfirmed ones count; without it, any CUEC is an open question.
+    state = ext.get("_cuec_state")
+    if ext.get("_cuecs") and state is not None:
+        open_ = sum(1 for c in state
+                    if c["status"] not in ("Implemented", "Not applicable"))
+        if open_:
+            adj.append(("CUECs not confirmed (%d of %d)" % (open_, len(state)),
+                        -5))
+    elif ext["cuecs_present"]:
         adj.append(("CUECs present", -5))
     if q and q["critical"]:
         adj.append(("Critical controls missing (%d)" % len(q["critical"]),
@@ -598,18 +565,22 @@ def build_findings(a, ext, missing, stale, gaps, q=None, domains=()):
         f.append(("Medium", "Stale report period",
                   "Period ended more than 12 months ago — request a bridge "
                   "letter covering the gap to today.", "CC4"))
-    if ext["cuecs_present"]:
+    if ext["cuecs_present"] and not ext.get("_cuecs"):
+        # without the extracted list, all we can say is that CUECs exist;
+        # the per-CUEC findings come from evidence_findings()
         f.append(("Medium", "Complementary User Entity Controls",
                   "These are controls you must operate. Confirm you perform "
                   "them or the assurance does not hold." +
                   (" " + ext["cuecs_summary"] if ext.get("cuecs_summary") else ""),
                   "CC2.3"))
     if ext.get("subservice_method") == "Carve-out":
+        named = ", ".join(o["name"] for o in ext.get("_subservice", []))
         subs = a.get("subprocessors", "").strip()
         f.append(("Medium", "Carved-out sub-processors",
                   "Subservice organisations' controls are excluded; assess the "
                   "sub-processor separately (nth-party risk)." +
-                  (" Declared sub-processors: %s." % subs if subs else ""),
+                  (" Named in the report: %s." % named if named else "") +
+                  (" Declared at intake: %s." % subs if subs else ""),
                   "CC9.2"))
     if a.get("rta") == "No" and a["tier"] < 3 and (gaps or a["tier"] == 1):
         f.append(("High" if a["tier"] == 1 else "Medium", "No right to audit",
@@ -786,6 +757,7 @@ def control_matrix(a, ext, domains):
         status = ("Not assessed" if score is None else "Met" if score >= 0.8
                   else "Partial" if score >= 0.4 else "Gap")
         rows.append({"id": cid, "name": name, "iso": iso, "tsc": tsc,
+                     "nist": ct.NIST_MAP.get(cid, []),
                      "evidence": evidence, "score": score, "status": status,
                      "sources": len(vals)})
     return rows
@@ -868,6 +840,216 @@ def contract_findings(a):
                   "the DPDP Act require a written processing agreement."
                   % ", ".join(sorted(personal)), "ISO A.5.34 · P6"))
     return f
+
+
+def scope_check(a, ext):
+    """Does the report's scope cover what we actually buy and where?"""
+    scope = ext.get("_scope") or {}
+    out = {"regions_missing": [], "product": None, "report_regions":
+           scope.get("regions", []), "system": scope.get("system")}
+    ours = [r for r in a.get("regions", []) if r != "Other"]
+    if scope.get("regions") and ours:
+        out["regions_missing"] = [r for r in ours
+                                  if r not in scope["regions"]]
+    product = (a.get("product") or "").strip()
+    hay = ext.get("_haystack", "")
+    if product and hay:
+        low = product.lower()
+        if any(low in x["text"].lower() for x in scope.get("exclusions", [])):
+            out["product"] = "excluded"
+        elif low not in hay:
+            out["product"] = "not named"
+        else:
+            out["product"] = "named"
+    return out
+
+
+def evidence_findings(a, ext):
+    """Findings from the reviewer's work on the report: review queue, CUECs,
+    subservice organisations, exceptions, scope and document triage."""
+    f = []
+    queue = [q for q in ext.get("_queue", [])
+             if not a.get(REVIEW_PREFIX + "qc_" + q)]
+    if queue:
+        f.append(("Medium", "%d extracted value%s awaiting reviewer "
+                  "confirmation" % (len(queue), "s" if len(queue) > 1 else ""),
+                  "Low-confidence or conflicting values: %s. Confirm them on "
+                  "the Evidence step before relying on this assessment."
+                  % ", ".join(pi.FIELD_LABEL.get(q, q) for q in queue),
+                  "CC9.2"))
+    cuecs = ext.get("_cuecs", [])
+    state = ext.get("_cuec_state", [])
+    no_owner = [c["text"] for c, s in zip(cuecs, state) if not s["owner"]
+                and s["status"] != "Not applicable"]
+    open_ = [c["text"] for c, s in zip(cuecs, state) if s["owner"]
+             and s["status"] in ("Not assessed", "In progress")]
+    if no_owner:
+        f.append(("High" if a.get("tier") == 1 else "Medium",
+                  "%d CUEC%s with no internal owner" % (
+                      len(no_owner), "s" if len(no_owner) > 1 else ""),
+                  "The report's assurance depends on controls we operate. "
+                  "Unowned: " + " · ".join(t[:90] for t in no_owner), "CC2.3"))
+    if open_:
+        f.append(("Low", "%d CUEC%s owned but not yet confirmed" % (
+            len(open_), "s" if len(open_) > 1 else ""),
+            "Collect evidence that these are operating: " +
+            " · ".join(t[:90] for t in open_), "CC2.3"))
+    subs = ext.get("_subservice", [])
+    sub_state = ext.get("_sub_state", [])
+    if ext.get("subservice_method") == "Carve-out":
+        none = [o["name"] for o, s in zip(subs, sub_state)
+                if s == "Not requested"]
+        waiting = [o["name"] for o, s in zip(subs, sub_state)
+                   if s == "Requested"]
+        if none:
+            f.append(("Medium", "No downstream evidence for carved-out "
+                      "sub-processors",
+                      "Request a SOC 2 / ISO 27001 or the vendor's oversight "
+                      "evidence for: %s." % ", ".join(none), "CC9.2"))
+        if waiting:
+            f.append(("Low", "Downstream evidence requested",
+                      "Awaiting evidence for: %s." % ", ".join(waiting),
+                      "CC9.2"))
+    for e, s in zip(ext.get("_exceptions", []), ext.get("_exc_state", [])):
+        where = "%s%s" % (e["control"], " (p.%s)" % e["page"]
+                          if e.get("page") else "")
+        if s["decision"] == "Escalate":
+            f.append(("High", "Exception escalated — %s" % where, e["text"],
+                      e["control"]))
+        elif s["decision"] == "Request remediation":
+            f.append(("Medium", "Remediation requested — %s" % where,
+                      e["text"] + " Track remediation evidence to closure.",
+                      e["control"]))
+        elif s["decision"] == "Undecided":
+            f.append(("Medium", "Exception not yet decided — %s" % where,
+                      e["text"] + " Accept, accept with a compensating "
+                      "control, request remediation or escalate.",
+                      e["control"]))
+    sc = scope_check(a, ext)
+    if sc["regions_missing"]:
+        f.append(("High", "Processing region outside the report scope",
+                  "Our data is processed in %s, but the SOC 2 scope covers "
+                  "%s only. The report gives no assurance for those regions."
+                  % (", ".join(sc["regions_missing"]),
+                     ", ".join(sc["report_regions"])), "CC9.2 · A.5.23"))
+    if sc["product"] == "excluded":
+        f.append(("High", "The product we use is excluded from the report",
+                  "“%s” appears in the report's scope exclusions."
+                  % a.get("product"), "CC9.2"))
+    elif sc["product"] == "not named":
+        f.append(("Medium", "The product we use isn't named in the report",
+                  "“%s” doesn't appear in the report; the system examined is "
+                  "“%s”. Confirm it covers the service we buy."
+                  % (a.get("product"), sc["system"] or "unknown"), "CC9.2"))
+    info = a.get("pdf")
+    if info and info.get("status") not in ("OK", None):
+        f.append(("Medium", "Document triage: %s" % info["status"],
+                  " ".join(info.get("issues", [])), "CC9.2"))
+    return f
+
+
+def obligation_matrix(a, ext):
+    """Cross-document review questions: SOC 2 vs MSA vs DPA (vs intake)."""
+    cl = contract_results(a)
+    docs = a.get("docs", [])
+    no_report = ext["report_type"] == "None"
+
+    def clause(cid):
+        doc = ct.CLAUSE[cid][1]
+        if doc not in docs or cid not in cl:
+            return None, "%s not provided" % doc
+        status, snip, note = cl[cid]
+        return status, (note + " — " if note else "") + (snip or "no clause "
+                                                          "found")
+    rows = []
+    s, d = clause("msa_soc2")
+    rows.append(("Does the contract require a current SOC 2 Type II?",
+                 "MSA", s, d))
+    s, d = clause("dpa_breach")
+    s2, d2 = clause("msa_breach")
+    rows.append(("Is there a breach-notification deadline?", "DPA / MSA",
+                 s or s2, d if s else d2))
+    s, d = clause("dpa_subp")
+    sub = ext.get("subservice_method")
+    extra = " · SOC 2: %s" % sub.lower() if sub not in (None, "Unknown") \
+        else ""
+    rows.append(("Are sub-processors governed and notified?",
+                 "DPA / SOC 2", s, d + extra))
+    sc = scope_check(a, ext)
+    if no_report:
+        rows.append(("Does the SOC 2 scope support the service we buy?",
+                     "SOC 2 / SOW", None, "no SOC 2 provided"))
+    else:
+        gaps = []
+        if sc["regions_missing"]:
+            gaps.append("regions %s not in scope" % ", ".join(
+                sc["regions_missing"]))
+        if sc["product"] in ("excluded", "not named"):
+            gaps.append("product %s" % sc["product"])
+        missing = [c for c in a.get("required", [])
+                   if c not in ext.get("tsc_categories", [])]
+        if missing:
+            gaps.append("%s not examined" % ", ".join(missing))
+        rows.append(("Does the SOC 2 scope support the service we buy?",
+                     "SOC 2 / SOW / intake",
+                     "Missing" if sc["regions_missing"] or sc["product"] ==
+                     "excluded" else "Partial" if gaps else "Met",
+                     "; ".join(gaps) or "system: %s · regions: %s" % (
+                         sc["system"] or "—",
+                         ", ".join(sc["report_regions"]) or "—")))
+    s, d = clause("dpa_delete")
+    rows.append(("Does the vendor have data-deletion obligations?", "DPA",
+                 s, d))
+    s, d = clause("msa_rta")
+    if s == "Missing" and a.get("rta") == "Yes":
+        d = "intake says Yes, but no audit clause in the MSA"
+    rows.append(("Do we hold a right to audit?", "MSA / intake", s, d))
+    cross = a.get("irq_crossborder") or len(a.get("regions", [])) > 1
+    s, d = clause("dpa_transfer")
+    rows.append(("Is there a cross-border transfer mechanism?", "DPA",
+                 s if cross else "Not needed" if s is None else s,
+                 d if cross else "no cross-border processing declared"))
+    return rows
+
+
+SIGNOFF = ["Pending", "Approve", "Approve with conditions", "Reject",
+           "Escalate to risk committee"]
+
+
+def evidence_rows(a):
+    """Evidence register rows for the documents actually in this review."""
+    reg = a.get("evidence", {})
+    keep = []
+    if a.get("extracted") and a["extracted"].get("report_type") != "None":
+        keep.append("SOC 2")
+    keep += [d for d in a.get("docs", []) if a.get("contracts", {}).get(d)]
+    return [reg[k] for k in keep if k in reg]
+
+
+def matrix_csv(matrix):
+    rows = ["Control ID,Control,ISO 27001:2022,SOC 2 TSC,NIST 800-53 Rev.5,"
+            "Status,Score,Evidence"]
+    for r in matrix:
+        ev = "; ".join("%s (%s)" % (l, n) for l, _, n in r["evidence"])
+        rows.append('%s,"%s","%s","%s","%s",%s,%s,"%s"' % (
+            r["id"], r["name"], " ".join(r["iso"]), " ".join(r["tsc"]),
+            " ".join(r["nist"]), r["status"], "" if r["score"] is None else
+            "%.2f" % r["score"], ev.replace('"', "'")))
+    return "\n".join(rows)
+
+
+def jira_csv(findings, vendor):
+    """Findings as a CSV that Jira's importer (or ServiceNow) can map."""
+    import csv
+    buf = io.StringIO()
+    wr = csv.writer(buf)
+    wr.writerow(["Summary", "Issue Type", "Priority", "Labels", "Description"])
+    for sev, title, detail, ref in findings:
+        wr.writerow(["[%s] %s" % (vendor, title), "Task",
+                     {"High": "High", "Medium": "Medium", "Low": "Low"}[sev],
+                     "vendor-risk cc9.2",
+                     "%s\n\nReference: %s" % (detail, ref)])
+    return buf.getvalue()
 
 
 BAND_COLOR = {"Low": "#1FAF5A", "Medium": "#F2C12E",
@@ -1000,6 +1182,9 @@ table.mx td.q{font-size:.76rem;color:#4B5563;max-width:420px}
   color:var(--green);font-weight:700;font-size:.7rem;display:flex;
   align-items:center;justify-content:center}
 .foot{text-align:center;color:var(--muted);font-size:.74rem;margin-top:26px}
+.chain{margin-top:12px;font-size:.82rem;color:#374151;background:#F6F7F9;
+  border-radius:8px;padding:10px 12px}
+.chain span{color:#B45309}
 .tabs-m{display:none}
 .card-b > img{display:block;margin:0 auto}
 [data-testid="stMarkdownContainer"] table{display:block;overflow-x:auto}
@@ -1009,9 +1194,9 @@ table.mx td.q{font-size:.76rem;color:#4B5563;max-width:420px}
   .block-container{padding-left:1.25rem;padding-right:1.25rem}
   .tabs{gap:16px}
   .tabs span{font-size:.76rem}
-  .st-key-grid4 [data-testid="stHorizontalBlock"],
+  [class*="st-key-grid4"] [data-testid="stHorizontalBlock"],
   .st-key-grid3 [data-testid="stHorizontalBlock"]{flex-wrap:wrap}
-  .st-key-grid4 [data-testid="stColumn"],
+  [class*="st-key-grid4"] [data-testid="stColumn"],
   .st-key-grid3 [data-testid="stColumn"]{min-width:calc(50% - 1rem) !important}
   [class*="st-key-stack_"] [data-testid="stHorizontalBlock"]{flex-wrap:wrap}
   [class*="st-key-stack_"] > div > [data-testid="stHorizontalBlock"] >
@@ -1161,6 +1346,24 @@ def status_pill(status):
     c = STATUS_COLOR[status]
     return ("<span class='pill' style='color:%s;border-color:%s;white-space:"
             "nowrap'>%s</span>" % (c, c, status))
+
+
+CONF_COLOR = {"High": "#1FAF5A", "Medium": "#F2C12E", "Low": "#F0405A"}
+CUEC_STATUS = ["Not assessed", "In progress", "Implemented", "Not applicable"]
+SUB_EVIDENCE = ["Not requested", "Requested", "Received: SOC 2",
+                "Received: ISO 27001", "Received: other evidence",
+                "Not needed"]
+EXC_DECISIONS = ["Undecided", "Accept", "Accept with compensating control",
+                 "Request remediation", "Escalate"]
+
+
+def conf_pill(conf):
+    if not conf:
+        return "<span class='pill' style='color:#9CA3AF;border-color:#D1D5DB'>" \
+               "—</span>"
+    c = CONF_COLOR.get(conf, "#9CA3AF")
+    return ("<span class='pill' style='color:%s;border-color:%s'>%s</span>"
+            % (c, c, conf))
 
 
 def band_scale(value):
@@ -1351,20 +1554,27 @@ def load_scenario(key):
              tier_reasons=reasons, demo=key, evidence_key="tour")
     evidence = demo.SCENARIOS[key]["evidence"]
     if evidence == "sample":
-        ext, name = rule_extract(SAMPLE_SOC2), "Sample synthetic SOC 2 (NimbusCRM)"
+        # the real pipeline on the synthetic 10-page PDF, minus the AI call
+        process_report(v, pi.sample_pdf(), SAMPLE_PDF_NAME, use_ai=False)
+        v.update(demo.REVIEW_PREFILL.get(key, {}))
     elif evidence == "paybridge":
-        ext, name = demo.paybridge_report(TODAY), "Synthetic SOC 2 (PayBridge)"
-    else:
-        ext, name = dict(NO_REPORT), "No report — questionnaire only"
-    if evidence != "none":
+        ext = demo.paybridge_report(TODAY)
         ext["_method"] = "tour data (fixed, no AI call)"
-    v.update(extracted=ext, evidence_name=name)
+        v.update(extracted=ext, evidence_name="Synthetic SOC 2 (PayBridge)")
+        register_evidence(v, "SOC 2", "Synthetic SOC 2 (PayBridge)",
+                          ct.fingerprint(json.dumps(ext, sort_keys=True)))
+    else:
+        v.update(extracted=dict(NO_REPORT),
+                 evidence_name="No report — questionnaire only")
     if key == "nimbus":  # the contract-review showcase
         v["docs"] = list(ct.DOCS)
         v["contracts"] = {d: {"name": "Sample %s (NimbusCRM)" % d,
                               "key": "sample",
                               "results": ct.analyze(d, ct.SAMPLES[d])}
                           for d in ct.DOCS}
+        for d in ct.DOCS:
+            register_evidence(v, d, "Sample %s (NimbusCRM)" % d,
+                              ct.fingerprint(ct.SAMPLES[d]))
     clear_questionnaire_widgets()
     st.session_state.a = v
     st.session_state.tour = key
@@ -1514,6 +1724,11 @@ elif step == 1:
                 "What service does the vendor provide?",
                 key=w("description", ""), height=68,
                 placeholder="e.g. CRM platform for the global sales pipeline")
+            a["product"] = st.text_input(
+                "Product / service you use (as the vendor names it)",
+                key=w("product", ""), placeholder="e.g. NimbusCRM Sales Cloud",
+                help="Checked against the SOC 2 scope: is this product named, "
+                     "or explicitly excluded?")
             c1, c2 = st.columns(2)
             a["bu"] = c1.text_input("Business unit", key=w("bu", ""),
                                     placeholder="e.g. Sales & Marketing")
@@ -1826,77 +2041,273 @@ elif step == 5:
                "continue on the questionnaire alone — then add the agreements "
                "you hold.")
     if not ai_backends():
-        st.warning("No AI key set — using the rule-based extractor. Add "
-                   "GROQ_API_KEY or HF_TOKEN in the app's Secrets to enable "
-                   "AI extraction.")
+        st.caption("No AI key set — the report is read with page-cited rules "
+                   "only (every value still shows its page and quote). Add "
+                   "GROQ_API_KEY or HF_TOKEN to cross-check with AI.")
 
     left, right = st.container(key="split_s5").columns([1, 1.4])
     with left:
         with st.container(border=True):
             up = st.file_uploader("SOC 2 / SOC 3 report (PDF)", type=["pdf"])
-            use_sample = st.button("↧ Load sample synthetic report instead",
+            use_sample = st.button("↧ Load the sample report (10-page PDF)",
                                    use_container_width=True)
             no_report = st.button("Vendor has no SOC 2 — use questionnaire "
                                   "only", use_container_width=True)
+            st.download_button("⬇ Download the sample PDF to try an upload",
+                               pi.sample_pdf(), file_name=SAMPLE_PDF_NAME,
+                               mime="application/pdf",
+                               use_container_width=True)
 
-    # Buttons are only True for the rerun they were clicked in, so the
-    # extraction is kept in session state; uploads re-extract only when new.
-    text = None
+    # Buttons are only True for the rerun they were clicked in, so results
+    # live in session state; an upload is re-read only when its hash changes.
     if use_sample:
-        text = SAMPLE_SOC2
-        a["evidence_key"] = "sample"
-        a["evidence_name"] = "Sample synthetic SOC 2 (NimbusCRM)"
+        with left, st.spinner("Reading 10 pages and citing every value…"):
+            process_report(a, pi.sample_pdf(), SAMPLE_PDF_NAME)
     elif no_report:
-        a["evidence_key"] = "none"
-        a["evidence_name"] = "No report — questionnaire only"
-        a["extracted"] = dict(NO_REPORT)
-    elif up is not None and a.get("evidence_key") != (up.name, up.size):
-        try:
-            text = read_pdf(up)
-            a["evidence_key"] = (up.name, up.size)
-            a["evidence_name"] = up.name
-        except Exception as e:  # noqa: BLE001
-            st.error("Could not read that PDF: %s" % e)
+        reset_review(a)
+        a.update(pdf=None, evidence_key="none", extracted=dict(NO_REPORT),
+                 evidence_name="No report — questionnaire only")
+        a.get("evidence", {}).pop("SOC 2", None)
+    elif up is not None:
+        data = up.getvalue()
+        if a.get("evidence_key") != pi.sha256(data):
+            with left, st.spinner("Triaging the PDF and extracting with page "
+                                  "citations…"):
+                process_report(a, data, up.name)
 
-    if text:
-        with left, st.spinner("Extracting report attributes..."):
-            a["extracted"] = extract(text)
-
+    info = a.get("pdf")
+    ext = a.get("extracted")
     with right:
-        ext = a.get("extracted")
-        if ext and ext["report_type"] == "None":
+        if info and ext is None:
+            html(card("Document triage — %s" % info["status"],
+                      "".join("<p style='margin:0 0 6px'>⚠ %s</p>" % i
+                              for i in info["issues"]) +
+                      "<p class='muted' style='margin:0'>Nothing was extracted "
+                      "from <b>%s</b>. Upload a text-based PDF, or continue on "
+                      "the questionnaire alone.</p>" % a.get("evidence_name"),
+                      icon("doc")))
+        elif ext and ext["report_type"] == "None":
             html(card("Evidence", "<p style='margin:0'>No SOC 2 on file. "
                       "Control maturity will come from the questionnaire at "
                       "<b>%d%% weight</b>, and every required category is "
                       "treated as independently untested.</p>" % SELF_PCT,
                       icon("doc")))
         elif ext:
+            eff = effective_ext(a)
             pills = "".join(
                 "<span class='pill' style='color:%s;border-color:%s'>%s</span>"
                 % (CAT_COLOR[c], CAT_COLOR[c], c)
-                for c in ext.get("tsc_categories", []) if c in CAT_COLOR)
-            period = "%s → %s" % (ext.get("period_start") or "?",
-                                  ext.get("period_end") or "?")
+                for c in eff.get("tsc_categories", []) if c in CAT_COLOR)
+            period = "%s → %s" % (eff.get("period_start") or "?",
+                                  eff.get("period_end") or "?")
+            open_q = [f for f in ext.get("_queue", [])
+                      if not a.get(REVIEW_PREFIX + "qc_" + f)]
             body = ("<div style='margin-bottom:10px'>%s</div>" % pills +
-                    legend("Report type", ext["report_type"], "#1FAF5A") +
+                    legend("Report type", eff["report_type"], "#1FAF5A") +
                     legend("Period", period, "#3D5AFE") +
-                    legend("Auditor opinion", ext["auditor_opinion"], "#6B6B6B") +
-                    legend("Exceptions noted",
-                           "Yes" if ext["exceptions_noted"] else "No", "#F2C12E") +
-                    legend("CUECs present",
-                           "Yes" if ext["cuecs_present"] else "No", "#4DD0E1") +
+                    legend("Auditor opinion", eff["auditor_opinion"],
+                           "#6B6B6B") +
+                    legend("Exceptions", len(ext.get("_exceptions", [])) or
+                           ("Yes" if eff["exceptions_noted"] else "None"),
+                           "#F2C12E") +
+                    legend("CUECs listed", len(ext.get("_cuecs", [])) or
+                           ("mentioned" if eff["cuecs_present"] else "None"),
+                           "#4DD0E1") +
                     legend("Subservice method",
-                           ext.get("subservice_method", "Unknown"), "#FF7A2F") +
+                           eff.get("subservice_method", "Unknown"), "#FF7A2F") +
+                    legend("Needs review", len(open_q),
+                           "#F0405A" if open_q else "#1FAF5A") +
                     "<p class='muted' style='font-size:.74rem;margin-top:10px'>"
-                    "%s · extracted using %s</p>"
-                    % (a["evidence_name"], ext["_method"]))
+                    "%s · %s%s</p>"
+                    % (a["evidence_name"], ext["_method"],
+                       " · triage: <b>%s</b>" % info["status"] if info else ""))
             html(card("Extracted report attributes", body, icon("doc")))
-            with st.expander("Raw extraction (JSON)"):
-                st.json({k: v for k, v in ext.items() if not k.startswith("_")})
         else:
             html(card("Extracted report attributes",
                       "<p class='muted'>Upload a report or load the sample to "
                       "see its attributes here.</p>", icon("doc")))
+
+    # ---- Review workspace: every value traced, every open item decided ----
+    if ext and ext["report_type"] != "None":
+        cites = ext.get("_cites", {})
+        queue = ext.get("_queue", [])
+        cuecs = ext.get("_cuecs", [])
+        subs = ext.get("_subservice", [])
+        excs = ext.get("_exceptions", [])
+        open_q = [f for f in queue if not a.get(REVIEW_PREFIX + "qc_" + f)]
+        html("<div class='h-page' style='font-size:1.25rem;margin-top:18px'>"
+             "Review workspace</div><div class='sub'>Every value is traced to "
+             "its page. Confirm anything uncertain, give each CUEC an owner, "
+             "request sub-processor evidence and decide on each exception.</div>")
+        tabs = st.tabs(["Reviewer summary", "Review queue (%d)" % len(open_q),
+                        "CUECs (%d)" % len(cuecs),
+                        "Subservice orgs (%d)" % len(subs),
+                        "Exceptions (%d)" % len(excs), "Document triage"])
+
+        with tabs[0]:
+            def cite_row(label, c, value=None):
+                if not c:
+                    return ("<tr><td data-l='Field'><b>%s</b></td><td "
+                            "data-l='Value'>%s</td><td data-l='Confidence'>%s"
+                            "</td><td class='q' data-l='Evidence'>—</td></tr>"
+                            % (label, value if value is not None else "—",
+                               conf_pill(None)))
+                v = value if value is not None else c["value"]
+                if isinstance(v, list):
+                    v = ", ".join(v) or "none"
+                where = "p.%s · " % c["page"] if c.get("page") else ""
+                return ("<tr><td data-l='Field'><b>%s</b></td><td "
+                        "data-l='Value'>%s%s</td><td data-l='Confidence'>%s"
+                        "<div class='rn'>%s</div></td><td class='q' "
+                        "data-l='Evidence'>%s“%s”</td></tr>"
+                        % (label, v, " <span class='rn'>(AI: %s)</span>"
+                           % (", ".join(c["alt"]) if isinstance(
+                               c.get("alt"), list) else c["alt"])
+                           if c.get("alt") else "", conf_pill(c["confidence"]),
+                           c.get("source", ""), where, c["excerpt"]))
+            rows = cite_row("Report type", cites.get("report_type"))
+            rows += cite_row("Auditor opinion", cites.get("auditor_opinion"))
+            per = cites.get("period_end")
+            rows += cite_row("Audit period", per, "%s → %s" % (
+                ext.get("period_start") or "?", ext.get("period_end") or "?")
+                if per else None)
+            rows += cite_row("Report date", cites.get("report_date"))
+            rows += cite_row("TSC categories examined",
+                             cites.get("tsc_categories"))
+            rows += cite_row("Subservice method", cites.get("subservice_method"))
+            rows += cite_row("CUECs listed", cites.get("cuecs"))
+            scope = ext.get("_scope") or {}
+            rows += cite_row("System in scope", None, scope.get("system"))
+            rows += cite_row("Regions in scope", scope.get("region_cite"))
+            for x in scope.get("exclusions", []):
+                rows += cite_row("Excluded from scope", {
+                    "value": "see quote", "page": x["page"],
+                    "excerpt": x["text"], "confidence": "High",
+                    "source": "rules"})
+            html("<table class='mx'><tr><th>Field</th><th>Value</th>"
+                 "<th>Confidence</th><th>Evidence (page · quote)</th></tr>%s"
+                 "</table>" % rows)
+            st.caption("High = an explicit sentence (or rules and AI agree) · "
+                       "Medium = inferred or AI only · Low = conflicting or "
+                       "weak evidence, sent to the review queue.")
+
+        with tabs[1]:
+            if not queue:
+                st.success("Nothing needs review — every key value has a "
+                           "High- or Medium-confidence citation.")
+            for f in queue:
+                c = cites.get(f) or {}
+                with st.container(border=True):
+                    st.markdown("**%s**" % pi.FIELD_LABEL.get(f, f))
+                    st.caption("Rules: %s%s · AI: %s" % (
+                        c.get("value", "not found"),
+                        " (p.%s)" % c["page"] if c.get("page") else "",
+                        c.get("alt", "—")))
+                    if c.get("excerpt"):
+                        st.caption("“%s”" % c["excerpt"])
+                    key = REVIEW_PREFIX + "q_" + f
+                    opts = pi.REVIEW_FIELDS.get(f)
+                    if f == "tsc_categories":
+                        a[key] = st.multiselect(
+                            "Reviewer value", ALL_CATEGORIES,
+                            key=w(key, [x for x in (c.get("value") or [])
+                                        if x in ALL_CATEGORIES]))
+                    elif opts:
+                        default = c.get("value") if c.get("value") in opts \
+                            else opts[-1]
+                        a[key] = st.selectbox("Reviewer value", opts,
+                                              key=w(key, default))
+                    else:
+                        a[key] = st.text_input("Reviewer value (YYYY-MM-DD)",
+                                               key=w(key, c.get("value") or ""))
+                    qc = REVIEW_PREFIX + "qc_" + f
+                    a[qc] = st.checkbox("Confirmed against the report",
+                                        key=w(qc, False))
+
+        with tabs[2]:
+            if not cuecs:
+                st.info("No CUEC list found in the report." +
+                        (" The report mentions CUECs — find them in the system "
+                         "description and record them manually."
+                         if ext.get("cuecs_present") else ""))
+            for i, c in enumerate(cuecs):
+                c1, c2, c3 = st.columns([2.2, 1.2, 1],
+                                        vertical_alignment="center")
+                c1.markdown("%s  \n<span class='ref'>%s</span>"
+                            % (c["text"], "p.%s" % c["page"] if c.get("page")
+                               else "from report summary"),
+                            unsafe_allow_html=True)
+                k_o = "%scuec_owner_%d" % (REVIEW_PREFIX, i)
+                k_s = "%scuec_status_%d" % (REVIEW_PREFIX, i)
+                a[k_o] = c2.text_input("Internal owner", key=w(k_o, ""),
+                                       placeholder="Owner / team")
+                a[k_s] = c3.selectbox("Status", CUEC_STATUS,
+                                      key=w(k_s, "Not assessed"))
+            if cuecs:
+                st.caption("CUECs are controls we must operate for the "
+                           "vendor's assurance to hold. Unowned or unconfirmed "
+                           "CUECs become findings and keep −5 on maturity.")
+
+        with tabs[3]:
+            if not subs:
+                st.info("No subservice organisations identified." +
+                        (" The report uses the %s method — check the system "
+                         "description for names."
+                         % ext.get("subservice_method").lower()
+                         if ext.get("subservice_method") not in
+                         (None, "Unknown") else ""))
+            for i, o in enumerate(subs):
+                c1, c2 = st.columns([2, 1.3], vertical_alignment="center")
+                c1.markdown("**%s** · %s · %s  \n<span class='ref'>%s</span>"
+                            % (o["name"], o["type"], o["method"].lower(),
+                               "p.%s" % o["page"] if o.get("page")
+                               else "from report summary"),
+                            unsafe_allow_html=True)
+                k = "%ssub_ev_%d" % (REVIEW_PREFIX, i)
+                a[k] = c2.selectbox("Downstream evidence", SUB_EVIDENCE,
+                                    key=w(k, "Not requested"))
+            if subs:
+                html("<div class='chain'>%s</div>" % " → ".join(
+                    ["<b>Us</b>", "<b>%s</b>" % a.get("vendor", "Vendor")] +
+                    ["{%s}" % ", ".join(o["name"] for o in subs)]).replace(
+                    "{", "<span>").replace("}", "</span>"))
+
+        with tabs[4]:
+            if not excs:
+                st.success("No exceptions found in the control tests.")
+            for i, e in enumerate(excs):
+                with st.container(border=True):
+                    st.markdown("**%s** · sample %s · %s  \n%s"
+                                % (e["control"], e["sample"],
+                                   "p.%s" % e["page"] if e.get("page")
+                                   else "from report summary", e["text"]))
+                    c1, c2 = st.columns([1, 1.6])
+                    k_d = "%sexc_dec_%d" % (REVIEW_PREFIX, i)
+                    k_n = "%sexc_note_%d" % (REVIEW_PREFIX, i)
+                    a[k_d] = c1.selectbox("Decision", EXC_DECISIONS,
+                                          key=w(k_d, "Undecided"))
+                    a[k_n] = c2.text_input("Rationale / compensating control",
+                                           key=w(k_n, ""))
+
+        with tabs[5]:
+            if info:
+                body = (legend("File", a.get("evidence_name"), "#111") +
+                        legend("Status", info["status"],
+                               "#1FAF5A" if info["status"] == "OK"
+                               else "#F2C12E") +
+                        legend("Pages with text", "%d of %d" % (
+                            info["text_pages"], info["pages"]), "#3D5AFE") +
+                        legend("Size", "%s KB" % info["size_kb"], "#6B6B6B") +
+                        "<div class='lg'><span><span class='dot' style='"
+                        "background:#4DD0E1'></span>SHA-256</span><span "
+                        "class='ref' style='word-break:break-all;max-width:"
+                        "70%%'>%s</span></div>" % info["sha256"] +
+                        "".join("<p style='margin:8px 0 0;font-size:.8rem'>⚠ "
+                                "%s</p>" % i for i in info["issues"]))
+                html(card("Document triage", body, icon("doc")))
+            else:
+                st.info("This report was entered as data (tour), not uploaded "
+                        "as a PDF, so there is no file to triage.")
 
     # ---- Contracts & agreements ----
     html("<div class='h-page' style='font-size:1.25rem;margin-top:18px'>"
@@ -1925,14 +2336,18 @@ elif step == 5:
                 store[doc] = {"name": "Sample %s (NimbusCRM)" % doc,
                               "key": "sample",
                               "results": ct.analyze(doc, ct.SAMPLES[doc])}
+                register_evidence(a, doc, store[doc]["name"],
+                                  ct.fingerprint(ct.SAMPLES[doc]))
             elif up_doc is not None and \
                     store.get(doc, {}).get("key") != (up_doc.name, up_doc.size):
                 try:
-                    body = (read_pdf(up_doc) if up_doc.name.lower().endswith(
-                        ".pdf") else up_doc.read().decode("utf-8", "ignore"))
+                    raw = up_doc.getvalue()
+                    body = (read_pdf(io.BytesIO(raw)) if up_doc.name.lower()
+                            .endswith(".pdf") else raw.decode("utf-8", "ignore"))
                     store[doc] = {"name": up_doc.name,
                                   "key": (up_doc.name, up_doc.size),
                                   "results": ct.analyze(doc, body)}
+                    register_evidence(a, doc, up_doc.name, pi.sha256(raw))
                 except Exception as e:  # noqa: BLE001
                     st.error("Could not read the %s: %s" % (doc, e))
             r = store.get(doc)
@@ -1979,7 +2394,7 @@ elif step == 5:
 # ----------------------------------------------------------------------
 elif step == 6:
     required = a["required"]
-    ext = a["extracted"]
+    ext = effective_ext(a)  # the report as the reviewer confirmed it
     rta = a.get("rta", "No")
     domains = qn.domains_for(required, a["tier"])
     per, q_overall, critical = qn.score(a.get("answers", {}), domains)
@@ -1989,8 +2404,10 @@ elif step == 6:
     residual, band = compute_residual(a["inherent"], maturity)
     gaps = assurance_gaps(missing, ext, stale)
     findings = build_findings(a, ext, missing, stale, gaps, q, domains)
-    findings = sorted(findings + contract_findings(a),
+    findings = sorted(findings + contract_findings(a) +
+                      evidence_findings(a, ext),
                       key=lambda x: {"High": 0, "Medium": 1, "Low": 2}[x[0]])
+    obligations = obligation_matrix(a, ext)
     matrix = control_matrix(a, ext, domains)
     clauses = contract_results(a)
     a["residual"], a["band"], a["maturity"] = residual, band, maturity
@@ -2145,22 +2562,24 @@ elif step == 6:
                     % SELF_PCT)
         html(card("Maturity breakdown", body, icon("chart")))
     with d2:
-        h, w = 170, 200
+        # chart size (named so they don't shadow the w() widget helper)
+        ch, cw = 170, 200
         cols = ""
         for i, (lbl, val, col) in enumerate(
                 [("Inherent", a["inherent"], "#111"),
                  ("Residual", residual, BAND_COLOR[band])]):
-            bh = val / 100 * (h - 40)
+            bh = val / 100 * (ch - 40)
             x = 40 + i * 80
             cols += ("<rect x='%d' y='%.1f' width='44' height='%.1f' rx='3' "
                      "fill='%s'/><text x='%d' y='%.1f' text-anchor='middle' "
                      "font-size='13' fill='#111'>%d</text><text x='%d' y='%d' "
                      "text-anchor='middle' font-size='10' fill='#6B7280'>%s"
-                     "</text>" % (x, h - 20 - bh, bh, col, x + 22,
-                                  h - 26 - bh, val, x + 22, h - 5, lbl))
+                     "</text>" % (x, ch - 20 - bh, bh, col, x + 22,
+                                  ch - 26 - bh, val, x + 22, ch - 5, lbl))
         svg = svg_img("<svg width='%d' height='%d' viewBox='0 0 %d %d'><line "
                       "x1='20' y1='%d' x2='%d' y2='%d' stroke='#E5E7EB'/>%s"
-                      "</svg>" % (w, h, w, h, h - 20, w - 10, h - 20, cols),
+                      "</svg>" % (cw, ch, cw, ch, ch - 20, cw - 10, ch - 20,
+                                  cols),
                       width="min(100%, 260px)")
         html(card("Risk reduction", svg + legend(
             "Reduced by controls", "−%d pts" % (a["inherent"] - residual),
@@ -2191,67 +2610,67 @@ elif step == 6:
                 "Extracted using %s</p>" % ext.get("_method"))
         html(card("Report attributes", body, icon("doc")))
 
-    # ---- Control mapping: ISO 27001 <-> SOC 2 ----
+    # ---- Control mapping: ISO 27001 <-> SOC 2 <-> NIST 800-53 ----
     html("<div class='h-page' style='font-size:1.3rem;margin-top:14px'>"
-         "Control mapping — ISO 27001:2022 ↔ SOC 2</div><div class='sub'>"
-         "%d unified controls, each scored automatically from every source "
-         "of evidence: contract clauses, questionnaire answers, intake and "
-         "the SOC 2 report.</div>" % len(matrix))
-    m1, m2, m3 = st.container(key="grid3").columns(3)
-    for col, key, title, names in ((m1, "iso", "ISO 27001:2022 Annex A",
-                                    ct.ISO),
-                                   (m2, "tsc", "SOC 2 Trust Services Criteria",
-                                    ct.TSC)):
+         "Control mapping — ISO 27001 ↔ SOC 2 ↔ NIST 800-53</div>"
+         "<div class='sub'>%d unified controls, each scored automatically from "
+         "every source of evidence: contract clauses, questionnaire answers, "
+         "intake and the SOC 2 report — and mapped many-to-many across three "
+         "frameworks.</div>" % len(matrix))
+    m1, m2, m3, m4 = st.container(key="grid4b").columns(4)
+    for col, key, title, label in (
+            (m1, "iso", "ISO 27001:2022 Annex A", "Annex A"),
+            (m2, "tsc", "SOC 2 Trust Services Criteria", "TSC"),
+            (m3, "nist", "NIST SP 800-53 Rev. 5", "800-53")):
         best = framework_rollup(matrix, key)
         counts = [(s_, sum(1 for v in best.values() if v == s_))
                   for s_ in STATUS_COLOR if s_ != "Missing"]
         body = ("<div style='text-align:center'>%s</div>"
                 % donut([(n, STATUS_COLOR[s_]) for s_, n in counts],
                         "%d/%d" % (counts[0][1], len(best)), "Met",
-                        size=150, stroke=16, center_size=28) +
+                        size=140, stroke=16, center_size=26) +
                 "".join(legend(s_, n, STATUS_COLOR[s_]) for s_, n in counts) +
-                how("%d %s references covered by the matrix. A reference is "
-                    "<b>Met</b> when at least one control mapped to it is Met."
-                    % (len(best), "Annex A" if key == "iso" else "TSC")))
+                how("%d %s references covered. A reference is <b>Met</b> when "
+                    "at least one control mapped to it is Met."
+                    % (len(best), label)))
         col.html(card(title, body, icon("grid")))
-    with m3:
+    with m4:
         if clauses:
             vals = [CLAUSE_VALUE[v[0]] for v in clauses.values()]
             c_pct = round(100 * sum(vals) / len(vals))
             body = ("<div style='text-align:center'>%s</div>"
                     % donut([(c_pct, "#1FAF5A" if c_pct >= 80 else "#F2C12E"
                               if c_pct >= 50 else "#F0405A")], "%d%%" % c_pct,
-                            "Contracts", size=150, total=100, center_size=28))
+                            "Contracts", size=140, total=100, center_size=26))
             for doc in a.get("docs", []):
                 res = a["contracts"].get(doc, {}).get("results", {})
                 if res:
                     dv = [CLAUSE_VALUE[v[0]] for v in res.values()]
                     pct = sum(dv) / len(dv)
-                    body += bar(ct.DOCS[doc], pct, "#1FAF5A" if pct >= .8 else
+                    body += bar(doc, pct, "#1FAF5A" if pct >= .8 else
                                 "#F2C12E" if pct >= .5 else "#F0405A",
                                 "%d%%" % round(100 * pct))
         else:
-            c_pct = None
             body = ("<p class='muted' style='margin:0'>No agreements provided. "
                     "Tick DPA / MSA / SOW on the Evidence step to review their "
                     "clauses.</p>")
         body += how("Met = 1, Partial = 0.5, Missing = 0 across the clauses of "
-                    "the agreements provided. Shown separately: contract gaps "
-                    "are Legal's to fix and don't change the residual score.")
+                    "the agreements provided. Contract gaps don't change the "
+                    "residual score.")
         html(card("Contract assurance", body, icon("doc")))
 
+    fw_all = ["ISO 27001:2022", "SOC 2 TSC", "NIST 800-53 Rev.5"]
     with st.container(border=True):
-        f1, f2 = st.columns([1, 1.4])
-        fw_pick = f1.pills("Frameworks to show", ["ISO 27001:2022", "SOC 2 TSC"],
-                           selection_mode="multi",
-                           default=["ISO 27001:2022", "SOC 2 TSC"],
-                           key="fw_pick")
+        f1, f2 = st.columns([1.3, 1.2])
+        fw_pick = f1.pills("Frameworks to show", fw_all, selection_mode="multi",
+                           default=fw_all, key="fw_pick")
         st_pick = f2.pills("Status", ["Met", "Partial", "Gap", "Not assessed"],
                            selection_mode="multi",
                            default=["Met", "Partial", "Gap", "Not assessed"],
                            key="st_pick")
-        show_iso = "ISO 27001:2022" in (fw_pick or [])
-        show_tsc = "SOC 2 TSC" in (fw_pick or [])
+        shown = [(f, k, n) for f, k, n in (
+            ("ISO 27001:2022", "iso", ct.ISO), ("SOC 2 TSC", "tsc", ct.TSC),
+            ("NIST 800-53 Rev.5", "nist", ct.NIST)) if f in (fw_pick or [])]
 
         def refs_cell(refs, names):
             return "".join("<div><span class='ref'>%s</span> <span class='rn'>"
@@ -2263,54 +2682,97 @@ elif step == 6:
             return ("<span class='ev' style='border-color:%s'><i style='"
                     "background:%s'></i>%s <em>%s</em></span>" % (c, c, label,
                                                                    note))
-        head = ("<tr><th>Control</th>%s%s<th>Evidence (auto-collected)</th>"
+        head = ("<tr><th>Control</th>%s<th>Evidence (auto-collected)</th>"
                 "<th>Status</th></tr>"
-                % ("<th>ISO 27001:2022</th>" if show_iso else "",
-                   "<th>SOC 2 TSC</th>" if show_tsc else ""))
+                % "".join("<th>%s</th>" % f for f, _, _ in shown))
         body = ""
         for r in matrix:
             if r["status"] not in (st_pick or []):
                 continue
             body += ("<tr><td data-l='Control'><span class='ref'>%s</span>"
-                     "<br><b>%s</b></td>%s%s<td data-l='Evidence'>%s</td>"
+                     "<br><b>%s</b></td>%s<td data-l='Evidence'>%s</td>"
                      "<td data-l='Status'>%s</td></tr>"
                      % (r["id"], r["name"],
-                        "<td data-l='ISO 27001:2022'>%s</td>"
-                        % refs_cell(r["iso"], ct.ISO)
-                        if show_iso else "",
-                        "<td data-l='SOC 2 TSC'>%s</td>"
-                        % refs_cell(r["tsc"], ct.TSC)
-                        if show_tsc else "",
+                        "".join("<td data-l='%s'>%s</td>" % (
+                            f, refs_cell(r[k], n)) for f, k, n in shown),
                         "".join(chip(*e) for e in r["evidence"]),
                         status_pill(r["status"]) + (
                             "<div class='rn' style='margin-top:4px'>%d source%s"
                             "</div>" % (r["sources"], "" if r["sources"] == 1
                                         else "s") if r["sources"] else "")))
         html("<div style='overflow-x:auto'><table class='mx'>%s%s</table></div>"
-             % (head, body or "<tr><td colspan='5' class='muted'>No controls "
+             % (head, body or "<tr><td colspan='6' class='muted'>No controls "
                 "match the selected status.</td></tr>"))
         st.caption("Each source scores Met = 1, Partial = 0.5, Gap = 0 "
                    "(questionnaire: Yes / Partial / No; SOC 2: category "
                    "examined or not). Control status = average of assessed "
                    "sources: Met ≥ 0.8 · Partial ≥ 0.4 · otherwise Gap. Grey "
                    "sources weren't provided.")
-        csv_rows = ["Control ID,Control,ISO 27001:2022,SOC 2 TSC,Status,Score,"
-                    "Evidence"]
-        for r in matrix:
-            ev = "; ".join("%s (%s)" % (l, n) for l, _, n in r["evidence"])
-            csv_rows.append('%s,"%s","%s","%s",%s,%s,"%s"' % (
-                r["id"], r["name"], " ".join(r["iso"]), " ".join(r["tsc"]),
-                r["status"], "" if r["score"] is None else
-                "%.2f" % r["score"], ev.replace('"', "'")))
-        st.download_button("⬇ Control matrix (CSV)", "\n".join(csv_rows),
+        st.download_button("⬇ Control matrix (CSV)", matrix_csv(matrix),
                            file_name="control_matrix_%s.csv" % (
                                a.get("vendor") or "vendor").replace(" ", "_"),
                            mime="text/csv")
-    with st.expander("Framework reference — ISO 27001:2022 Annex A and TSC "
-                     "titles used in this matrix"):
-        r1, r2 = st.columns(2)
+    with st.expander("Framework reference — ISO 27001:2022 Annex A, TSC and "
+                     "NIST 800-53 titles used in this matrix"):
+        r1, r2, r3 = st.columns(3)
         r1.markdown("\n".join("- `%s` %s" % kv for kv in ct.ISO.items()))
         r2.markdown("\n".join("- `%s` %s" % kv for kv in ct.TSC.items()))
+        r3.markdown("\n".join("- `%s` %s" % kv for kv in ct.NIST.items()))
+
+    # ---- Cross-document obligations: SOC 2 vs MSA vs DPA ----
+    html("<div class='h-page' style='font-size:1.3rem;margin-top:14px'>"
+         "Cross-document obligations</div><div class='sub'>What the SOC 2 "
+         "shows versus what the MSA, DPA and SOW actually commit the vendor "
+         "to.</div>")
+    ob_rows = "".join(
+        "<tr><td data-l='Review question'><b>%s</b></td><td data-l='Source'>"
+        "<span class='ref'>%s</span></td><td data-l='Status'>%s</td>"
+        "<td class='q' data-l='Evidence'>%s</td></tr>"
+        % (qtext, src, status_pill(status) if status in STATUS_COLOR else
+           ("<span class='pill' style='color:#6B7280;border-color:#D1D5DB'>"
+            "%s</span>" % (status or "Not provided")), detail)
+        for qtext, src, status, detail in obligations)
+    html("<div class='card'><div class='card-b' style='overflow-x:auto'>"
+         "<table class='mx'><tr><th>Review question</th><th>Source</th>"
+         "<th>Status</th><th>Evidence</th></tr>%s</table></div></div>"
+         % ob_rows)
+
+    # ---- Evidence register & reviewer sign-off ----
+    html("<div class='h-page' style='font-size:1.3rem;margin-top:14px'>"
+         "Evidence register &amp; sign-off</div><div class='sub'>Every "
+         "document reviewed, fingerprinted with SHA-256, and the reviewer's "
+         "decision — ready for peer review or audit.</div>")
+    reg = evidence_rows(a)
+    e1, e2 = st.container(key="stack_d4").columns([1.6, 1])
+    with e1:
+        rows = "".join(
+            "<tr><td data-l='ID'><span class='ref'>%s</span></td>"
+            "<td data-l='Document'><b>%s</b><div class='rn'>%s</div></td>"
+            "<td data-l='SHA-256'><span class='ref' title='%s'>%s…</span></td>"
+            "<td data-l='Pages'>%s</td><td data-l='Status'>%s</td>"
+            "<td data-l='Loaded'><span class='rn'>%s</span></td></tr>"
+            % (r["id"], r["type"], r["name"], r["sha256"], r["sha256"][:16],
+               r["pages"] or "—", r["status"], r["loaded"]) for r in reg)
+        html("<div class='card'><div class='card-b' style='overflow-x:auto'>"
+             "<table class='mx'><tr><th>ID</th><th>Document</th>"
+             "<th>SHA-256</th><th>Pages</th><th>Status</th><th>Loaded</th>"
+             "</tr>%s</table></div></div>" % (rows or "<tr><td colspan='6' "
+                                               "class='muted'>No documents "
+                                               "loaded.</td></tr>"))
+    with e2:
+        with st.container(border=True):
+            st.markdown("**Reviewer sign-off**")
+            a["signoff_name"] = st.text_input("Reviewer",
+                                              key=w("signoff_name", ""),
+                                              placeholder="Name, role")
+            a["signoff_decision"] = st.selectbox(
+                "Decision", SIGNOFF, key=w("signoff_decision", "Pending"))
+            a["signoff_note"] = st.text_area("Conditions / comments",
+                                             key=w("signoff_note", ""),
+                                             height=68)
+            st.caption("Recorded in the evidence pack with today's date (%s). "
+                       "The decision is the reviewer's — the app recommends, "
+                       "it doesn't approve." % TODAY.isoformat())
 
     # ---- Row 4: findings + recommendation ----
     rec = {
@@ -2387,6 +2849,25 @@ elif step == 6:
             "report_extracted": {k: v for k, v in ext.items()
                                  if not k.startswith("_")},
             "extraction_method": ext.get("_method"),
+            "citations": {f: {"value": c["value"], "page": c.get("page"),
+                              "quote": c["excerpt"],
+                              "confidence": c["confidence"],
+                              "source": c.get("source")}
+                          for f, c in ext.get("_cites", {}).items()},
+            "review_queue": {pi.FIELD_LABEL.get(f, f): {
+                "reviewer_value": a.get(REVIEW_PREFIX + "q_" + f),
+                "confirmed": bool(a.get(REVIEW_PREFIX + "qc_" + f))}
+                for f in ext.get("_queue", [])},
+            "report_scope": {k: v for k, v in (ext.get("_scope") or {}).items()
+                             if k != "region_cite"},
+            "cuecs": [dict(c, **s) for c, s in zip(ext.get("_cuecs", []),
+                                                   ext.get("_cuec_state", []))],
+            "subservice_organisations": [
+                dict(o, downstream_evidence=s) for o, s in zip(
+                    ext.get("_subservice", []), ext.get("_sub_state", []))],
+            "exceptions": [dict(e, **s) for e, s in zip(
+                ext.get("_exceptions", []), ext.get("_exc_state", []))],
+            "document_triage": a.get("pdf"),
             "control_maturity": maturity,
             "maturity_breakdown": [{"factor": l, "points": p}
                                    for l, p in adjustments],
@@ -2399,57 +2880,136 @@ elif step == 6:
                                   for k, v in a["contracts"][doc][
                                       "results"].items()}}
                 for doc in a.get("docs", []) if a.get("contracts", {}).get(doc)},
+            "cross_document_obligations": [
+                {"question": qt, "source": src, "status": stt or "Not provided",
+                 "evidence": det} for qt, src, stt, det in obligations],
             "control_matrix": [
                 {"id": r["id"], "control": r["name"],
                  "iso_27001_2022": r["iso"], "soc2_tsc": r["tsc"],
-                 "status": r["status"],
+                 "nist_800_53_r5": r["nist"], "status": r["status"],
                  "score": None if r["score"] is None else round(r["score"], 2),
                  "evidence": [{"source": l, "value": v, "note": n}
                               for l, v, n in r["evidence"]]}
                 for r in matrix],
+            "evidence_register": evidence_rows(a),
             "residual_score": residual, "residual_band": band,
             "findings": plain,
             "recommendation": rec,
-            "disclaimer": "Demo on synthetic data. Not audit advice.",
+            "sign_off": {"reviewer": a.get("signoff_name") or None,
+                         "decision": a.get("signoff_decision", "Pending"),
+                         "comments": a.get("signoff_note") or None,
+                         "date": TODAY.isoformat()},
+            "disclaimer": "Demo on synthetic data. Not audit or legal advice.",
         }
-        md = ["# SOC 2 Trust Services Evaluation",
-              "**Vendor:** %s (%s)  " % (a.get("vendor"),
-                                         a.get("legal_name") or "—"),
-              "**Generated:** %s  " % TODAY.isoformat(),
-              "**Category:** %s · **Owner:** %s · **Renewal:** %s  "
-              % (a.get("category"), a.get("owner") or "unassigned",
-                 iso(a.get("contract_end")) or "—"),
-              "**Inherent:** %d (%s)  " % (a["inherent"], TIER_LABEL[a["tier"]]),
-              "**Right to audit:** %s  " % rta,
-              "**Evidence:** %s · %s  " % (a.get("evidence_name"),
-                                           ext["auditor_opinion"]),
+        reg = evidence_rows(a)
+        md = ["# Vendor Trust Evaluation — %s" % a.get("vendor"),
+              "**Legal entity:** %s  " % (a.get("legal_name") or "—"),
+              "**Generated:** %s · **Reviewer:** %s · **Decision:** %s  "
+              % (TODAY.isoformat(), a.get("signoff_name") or "—",
+                 a.get("signoff_decision", "Pending")),
+              "**Category:** %s · **Product:** %s · **Owner:** %s · "
+              "**Renewal:** %s  " % (a.get("category"), a.get("product") or "—",
+                                     a.get("owner") or "unassigned",
+                                     iso(a.get("contract_end")) or "—"),
+              "**Inherent:** %d (%s) · **Right to audit:** %s  "
+              % (a["inherent"], TIER_LABEL[a["tier"]], rta),
+              "**Evidence:** %s · %s · %s  " % (
+                  a.get("evidence_name"), ext["report_type"],
+                  ext["auditor_opinion"]),
               "**Questionnaire:** %d%% self-attested · %d critical gaps  "
               % (q_overall, len(critical)),
               "**Control maturity:** %d/100 · **Residual:** %d (%s)  "
               % (maturity, residual, band),
-              "**Required TSC:** %s  " % ", ".join(required),
-              "**Criteria coverage:** %d%%  " % cov_pct,
+              "**Required TSC:** %s · **Criteria coverage:** %d%%  "
+              % (", ".join(required), cov_pct),
               "", "## Findings"] + ["- " + p for p in plain] \
-            + ["", "## Recommendation", rec, "",
-               "## Control mapping (ISO 27001:2022 ↔ SOC 2)",
-               "| Control | ISO 27001 | SOC 2 TSC | Status |",
-               "|---|---|---|---|"] \
-            + ["| %s %s | %s | %s | %s |" % (r["id"], r["name"],
-                                            ", ".join(r["iso"]),
-                                            ", ".join(r["tsc"]), r["status"])
-               for r in matrix] \
-            + ["", "## Control questionnaire"] \
-            + ["- %s: %s" % (d["name"], "n/a" if per[d["key"]] is None
-                             else "%d%%" % per[d["key"]]) for d in domains] \
-            + ["", "_Demo on synthetic data. Not audit advice._"]
+            + ["", "## Recommendation", rec]
+        if a.get("signoff_note"):
+            md += ["", "**Reviewer conditions:** %s" % a["signoff_note"]]
+        if ext.get("_cites"):
+            md += ["", "## Report evidence (page citations)",
+                   "| Field | Value | Page | Confidence | Quote |",
+                   "|---|---|---|---|---|"]
+            for f, c in ext["_cites"].items():
+                v = c["value"]
+                md.append("| %s | %s | %s | %s | %s |" % (
+                    pi.FIELD_LABEL.get(f, f.replace("_", " ")),
+                    ", ".join(v) if isinstance(v, list) else v,
+                    c.get("page") or "—", c["confidence"],
+                    c["excerpt"].replace("|", "/")))
+        if ext.get("_cuecs"):
+            md += ["", "## CUECs", "| CUEC | Page | Owner | Status |",
+                   "|---|---|---|---|"]
+            md += ["| %s | %s | %s | %s |" % (c["text"].replace("|", "/"),
+                                             c.get("page") or "—",
+                                             s["owner"] or "—", s["status"])
+                   for c, s in zip(ext["_cuecs"], ext["_cuec_state"])]
+        if ext.get("_exceptions"):
+            md += ["", "## Exceptions", "| Control | Sample | Page | Decision "
+                   "| Rationale |", "|---|---|---|---|---|"]
+            md += ["| %s | %s | %s | %s | %s |" % (
+                e["control"], e["sample"], e.get("page") or "—", s["decision"],
+                s["note"] or "—") for e, s in zip(ext["_exceptions"],
+                                                   ext["_exc_state"])]
+        if ext.get("_subservice"):
+            md += ["", "## Subservice organisations",
+                   "| Organisation | Type | Method | Downstream evidence |",
+                   "|---|---|---|---|"]
+            md += ["| %s | %s | %s | %s |" % (o["name"], o["type"],
+                                             o["method"], s)
+                   for o, s in zip(ext["_subservice"], ext["_sub_state"])]
+        md += ["", "## Cross-document obligations",
+               "| Question | Source | Status | Evidence |", "|---|---|---|---|"]
+        md += ["| %s | %s | %s | %s |" % (qt, src, stt or "Not provided",
+                                         det.replace("|", "/"))
+               for qt, src, stt, det in obligations]
+        md += ["", "## Control mapping (ISO 27001:2022 ↔ SOC 2 ↔ NIST 800-53)",
+               "| Control | ISO 27001 | SOC 2 TSC | NIST 800-53 | Status |",
+               "|---|---|---|---|---|"]
+        md += ["| %s %s | %s | %s | %s | %s |" % (
+            r["id"], r["name"], ", ".join(r["iso"]), ", ".join(r["tsc"]),
+            ", ".join(r["nist"]), r["status"]) for r in matrix]
+        md += ["", "## Control questionnaire"]
+        md += ["- %s: %s" % (d["name"], "n/a" if per[d["key"]] is None
+                             else "%d%%" % per[d["key"]]) for d in domains]
+        md += ["", "## Evidence register",
+               "| ID | Document | File | SHA-256 | Loaded |",
+               "|---|---|---|---|---|"]
+        md += ["| %s | %s | %s | `%s` | %s |" % (r["id"], r["type"], r["name"],
+                                                r["sha256"], r["loaded"])
+               for r in reg]
+        md += ["", "_Demo on synthetic data. Not audit or legal advice._"]
         fname = (a.get("vendor") or "vendor").replace(" ", "_")
-        st.download_button("⬇ Download JSON",
-                           json.dumps(report, indent=2, default=str),
-                           file_name="soc2_eval_%s.json" % fname,
-                           mime="application/json", use_container_width=True)
-        st.download_button("⬇ Download report (Markdown)", "\n".join(md),
-                           file_name="soc2_eval_%s.md" % fname,
+        md_text = "\n".join(md)
+        json_text = json.dumps(report, indent=2, default=str)
+        jira = jira_csv(findings, a.get("vendor") or "Vendor")
+        pack = io.BytesIO()
+        with zipfile.ZipFile(pack, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("vendor_review_%s.md" % fname, md_text)
+            z.writestr("vendor_review_%s.json" % fname, json_text)
+            z.writestr("control_matrix_%s.csv" % fname, matrix_csv(matrix))
+            z.writestr("jira_import_%s.csv" % fname, jira)
+            z.writestr("evidence_register_%s.csv" % fname, "\n".join(
+                ["ID,Type,File,SHA-256,Pages,Status,Loaded"] +
+                ['%s,%s,"%s",%s,%s,%s,%s' % (
+                    r["id"], r["type"], r["name"], r["sha256"],
+                    r["pages"] or "", r["status"], r["loaded"])
+                 for r in reg]))
+        st.download_button("⬇ Evidence pack (ZIP)", pack.getvalue(),
+                           file_name="vendor_review_pack_%s.zip" % fname,
+                           mime="application/zip", type="primary",
+                           use_container_width=True)
+        st.download_button("⬇ Report (Markdown)", md_text,
+                           file_name="vendor_review_%s.md" % fname,
                            mime="text/markdown", use_container_width=True)
+        st.download_button("⬇ Report (JSON)", json_text,
+                           file_name="vendor_review_%s.json" % fname,
+                           mime="application/json", use_container_width=True)
+        st.download_button("⬇ Findings for Jira (CSV)", jira,
+                           file_name="jira_import_%s.csv" % fname,
+                           mime="text/csv", use_container_width=True)
+        st.caption("The pack bundles the report, JSON, control matrix, Jira "
+                   "import and evidence register (with SHA-256 hashes).")
 
     c1, _, c2 = st.container(key="btnrow_end").columns([1, 2, 1])
     if c1.button("← Back", use_container_width=True):
@@ -2461,5 +3021,5 @@ elif step == 6:
         goto(0)
 
 html("<p class='foot'>Designed by <b>%s</b> · GRC &amp; security automation · "
-     "<span class='dev' style='font-size:.62rem'>IN DEVELOPMENT</span> · v1</p>"
+     "<span class='dev' style='font-size:.62rem'>IN DEVELOPMENT</span> · v2.1</p>"
      % DESIGNER)

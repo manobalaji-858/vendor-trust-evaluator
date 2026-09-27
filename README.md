@@ -6,10 +6,12 @@ Every vendor has assessments. Few check what they actually cover. This app
 profiles a vendor, scores and tiers its inherent risk, scopes the AICPA Trust
 Services Criteria it must meet, runs a tier-appropriate control questionnaire,
 then tests all of it against the vendor's SOC 2 report and contracts (DPA, MSA,
-SOW) — with every control mapped to **SOC 2 TSC** and **ISO/IEC 27001:2022**.
+SOW) — with every control mapped to **SOC 2 TSC**, **ISO/IEC 27001:2022** and
+**NIST SP 800-53 Rev. 5**. Every value it relies on is cited to a page, and
+anything uncertain goes to a human reviewer.
 
 **Designed by:** Manobalaji Ganapathi — IT risk, audit & control automation
-**Status:** v2 · in development · demo on synthetic data
+**Status:** v2.1 · in development · demo on synthetic data
 
 > **Live demo:** _add your Streamlit Cloud link here_ — start with
 > **▶ Guided tour** on the home page (60 seconds, no input needed).
@@ -22,9 +24,11 @@ SOW) — with every control mapped to **SOC 2 TSC** and **ISO/IEC 27001:2022**.
 - **Report quality** — Type I vs Type II, auditor opinion, exceptions, stale periods needing a bridge letter
 - **Shared responsibility** — complementary user entity controls (CUECs) and carved-out sub-processors
 - **Proportionate due diligence** — Tier 1 / 2 / 3 decides how deep the questionnaire goes
-- **Contracts** — 25 clauses across DPA, MSA and SOW, each quoted as evidence
+- **Report scope** — whether the SOC 2 covers the product, regions and data flows you actually use
+- **Contracts** — 26 clauses across DPA, MSA and SOW, each quoted with its § section
 - **Contradictions** — e.g. "right to audit: Yes" at intake but no audit clause in the MSA; 72-hour breach notice claimed but the DPA says 96 hours
-- **Control mapping** — 18 unified controls scored from every source and mapped to ISO 27001 Annex A and SOC 2
+- **Control mapping** — 18 unified controls scored from every source and mapped to ISO 27001 Annex A, SOC 2 and NIST 800-53
+- **Traceability** — page citations, confidence levels, a review queue, SHA-256 evidence register and reviewer sign-off
 - **Residual risk** — what's left after evidenced controls, with a recommendation
 
 ## How it works
@@ -35,8 +39,8 @@ SOW) — with every control mapped to **SOC 2 TSC** and **ISO/IEC 27001:2022**.
 | **2 · Inherent risk** | Uptime dependence, customer-facing, processing reliance, credentials, code in our environment, AI training on our data, cross-border transfers, fourth parties, regulations — and **tier escalation** |
 | **3 · TSC scope** | Security always; Availability, Confidentiality, Processing Integrity and Privacy added from the answers, each with the reason shown |
 | **4 · Control questionnaire** | Up to 56 controls in 11 domains, depth set by tier, each mapped to a TSC criterion; critical controls flagged |
-| **5 · Evidence & contracts** | SOC 2 / SOC 3 upload (AI extraction with a rule-based fallback) or questionnaire-only; DPA / MSA / SOW checklist with upload or sample |
-| **6 · Dashboard** | Residual risk, TSC coverage, maturity breakdown, ISO 27001 ↔ SOC 2 control matrix, contract assurance, findings and downloadable reports (JSON, Markdown, matrix CSV) |
+| **5 · Evidence & contracts** | SOC 2 PDF triage and page-cited extraction (AI as a cross-check), a **review workspace** — reviewer summary, review queue, CUEC owners, sub-processor evidence, exception decisions — or questionnaire-only; DPA / MSA / SOW checklist with upload or sample |
+| **6 · Dashboard** | Residual risk, TSC coverage, maturity breakdown, ISO 27001 ↔ SOC 2 ↔ NIST 800-53 control matrix, cross-document obligations, evidence register and sign-off, findings, and a one-click **evidence pack** (ZIP) plus Jira CSV |
 
 ### Guided tour & simulate
 
@@ -51,6 +55,35 @@ Three synthetic vendors, one per tier (`demo.py`):
 **▶ Guided tour** pre-fills every step with a narration panel explaining what
 to look at. **⚡ Simulate results** jumps straight to the dashboard. Tour data is
 fixed (no AI call), so results are repeatable.
+
+## What's new in v2.1 — PDF intelligence
+
+A SOC 2 is not a pass/fail certificate; the signals that matter are scattered
+across 100+ pages. v2.1 turns the PDF into cited, reviewable evidence:
+
+- **Document triage** — detects unreadable, password-protected, scanned (OCR
+  needed) and suspiciously short files before anything is extracted, and
+  fingerprints each file with SHA-256
+- **Page-cited extraction** — report type, opinion, audit period, report date,
+  TSC categories, carve-out / inclusive method, CUECs, subservice organisations,
+  exceptions (with control and sample size) and scope (system, regions,
+  exclusions), each with the **page and the sentence** it came from
+- **AI as a cross-check, not the source** — the AI reads only the cited pages;
+  agreement raises confidence, disagreement sends the field to a **review queue**
+- **Scope match** — flags when your processing regions or product aren't
+  covered, e.g. *EU data, SOC 2 scope US only*
+- **Review workspace** — owners and status for each CUEC, downstream evidence
+  for each carved-out sub-processor (with the dependency chain), and a decision
+  for each exception: accept, compensating control, remediate or escalate
+- **Cross-document obligations** — SOC 2 vs MSA vs DPA: SOC 2 required by
+  contract, breach deadline, sub-processor governance, scope, deletion, audit
+  rights, transfer mechanism
+- **NIST SP 800-53 Rev. 5** added to the many-to-many control matrix
+- **Evidence pack** — one ZIP with the report (Markdown + JSON), control
+  matrix, Jira import CSV and evidence register with hashes; reviewer sign-off
+  recorded with the decision
+- **Try it** — download the synthetic 10-page SOC 2 from the Evidence step and
+  upload it to see the full pipeline
 
 ## Scoring model
 
@@ -75,7 +108,7 @@ Escalation rules only ever raise a tier.
 - Baseline: SOC 2 Type II 85 · Type I / SOC 3 35 · no report = 60% of the questionnaire score
 - Qualified opinion −20 · adverse / disclaimer −45 · exceptions −10 · period older than 12 months −15
 - Each required TSC category not covered −12 (−6 if the matching questionnaire domain scores ≥ 75%)
-- CUECs −5 · critical controls the vendor says are missing −5 each (max −15)
+- CUECs −5 while any are unconfirmed (0 once each is owned and implemented) · critical controls the vendor says are missing −5 each (max −15)
 - Right to audit: +5 when there are gaps it can close; −5 without one for Tier 1 / 2 (Tier 3 exempt)
 
 **Residual risk** = inherent × (1 − 0.70 × maturity ÷ 100) → Low ≤ 20 · Medium ≤ 40 · High ≤ 65 · Critical
@@ -123,14 +156,17 @@ and the app says why on screen.
 |---|---|
 | `app.py` | Wizard UI, scoring engines, findings, dashboard |
 | `questionnaire.py` | 56-question control bank, tier depth, scoring |
-| `contracts.py` | Clause library, sample agreements, ISO 27001 / TSC mapping |
-| `demo.py` | Synthetic demo vendors and guided-tour narration |
+| `contracts.py` | Clause library, sample agreements, ISO 27001 / TSC / NIST 800-53 mapping |
+| `demo.py` | Synthetic demo vendors, reviewer decisions and guided-tour narration |
+| `pdfintel.py` | PDF triage, page-cited extraction, AI cross-check, review queue, synthetic 10-page sample PDF |
 
 ## Versions
 
 - **v1 · classic** — the original single-page SOC 2 validator:
   [soc2-report-validator](https://github.com/manobalaji-858/soc2-report-validator)
 - **v2 · Vendor Trust Evaluator** — this repository
+- **v2.1 · PDF intelligence** — page citations, review workflow, NIST mapping, evidence pack
+- What's next: see [ROADMAP.md](ROADMAP.md)
 
 ## Notes
 

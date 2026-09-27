@@ -69,6 +69,9 @@ CLAUSES = [
     ("msa_rta", "MSA", "Right to audit",
      [r"right to audit", r"audit rights", r"may audit",
       r"(?:conduct|perform) an? audit"], None, True, None),
+    ("msa_soc2", "MSA", "Current SOC 2 Type II (or equivalent) required",
+     [r"SOC 2 Type (?:II|2)", r"SSAE ?18", r"ISAE ?3402",
+      r"independent (?:audit|assurance) report"], None, False, None),
     ("msa_secsched", "MSA", "Information security schedule / requirements",
      [r"information security (?:schedule|requirements|policy|exhibit)",
       r"security (?:schedule|exhibit|addendum)"], None, False, None),
@@ -115,32 +118,61 @@ CLAUSES = [
 CLAUSE = {c[0]: c for c in CLAUSES}
 
 
+SECTION_RE = r"^\s*(\d+(?:\.\d+)*)[.)]\s"
+
+
 def sentences(text):
-    # short fragments are headings ("7. Deletion.") — not quotable evidence
-    parts = re.split(r"(?<=[.;:])\s+|\n+", re.sub(r"[ \t]+", " ", text))
-    return [p.strip() for p in parts if len(p.strip()) > 30]
+    """(section, sentence) pairs. A numbered line ("5. Audit. ...") starts a
+    section; short fragments are headings, not quotable evidence."""
+    out, section = [], None
+
+    def heading(line):
+        letters = [c for c in line if c.isalpha()]
+        return len(line) < 90 and len(letters) > 3 and \
+            sum(c.isupper() for c in letters) / len(letters) > 0.8
+
+    text = "\n".join(l for l in text.split("\n") if not heading(l.strip()))
+    chunks = re.split(r"\n(?=\s*\d+(?:\.\d+)*[.)]\s)", text)
+    for chunk in chunks:
+        m = re.match(SECTION_RE, chunk)
+        if m:
+            section = m.group(1)
+        flat = re.sub(r"\s+", " ", chunk)
+        for p in re.split(r"(?<=[.;:])\s+", flat):
+            if len(p.strip()) > 30:
+                out.append((section, p.strip()))
+    return out
 
 
 def analyze(doc, text):
-    """{clause_id: (status, snippet, note)} for every clause of `doc`."""
+    """{clause_id: (status, snippet, note)} for every clause of `doc`.
+    The snippet starts with its section number, e.g. "§5 · Customer may…"."""
     sents = sentences(text)
     out = {}
     for cid, d, _, finds, near, _, grade in CLAUSES:
         if d != doc:
             continue
         hit = None
-        for s in sents:
+        for section, s in sents:
             if any(re.search(f, s, re.I) for f in finds) and \
                     (not near or re.search(near, s, re.I)):
-                hit = s
+                hit = (section, s)
                 break
         if not hit:
             out[cid] = ("Missing", "", "")
             continue
-        status, note = grade(hit) if grade else ("Met", "")
-        snippet = hit if len(hit) <= 240 else hit[:237] + "…"
-        out[cid] = (status, snippet, note)
+        section, s = hit
+        status, note = grade(s) if grade else ("Met", "")
+        quote = s if len(s) <= 230 else s[:227] + "…"
+        out[cid] = (status, ("§%s · " % section if section else "") + quote,
+                    note)
     return out
+
+
+def fingerprint(text):
+    """SHA-256 of a document's text, for the evidence register."""
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
 
 
 # ---- ISO/IEC 27001:2022 Annex A and TSC names for referenced controls ----
@@ -214,8 +246,8 @@ CONTROLS = [
       ("clause", "dpa_sec")]),
     ("UC02", "Independent assurance and right to audit",
      ["A.5.22", "A.5.35"], ["CC4.1", "CC9.2"],
-     [("clause", "msa_rta"), ("clause", "dpa_audit"), ("rta",),
-      ("soc2type",), ("q", "edd1")]),
+     [("clause", "msa_rta"), ("clause", "msa_soc2"), ("clause", "dpa_audit"),
+      ("rta",), ("soc2type",), ("q", "edd1")]),
     ("UC03", "Confidentiality and non-disclosure",
      ["A.6.6"], ["C1.1"],
      [("clause", "msa_conf"), ("clause", "dpa_conf"), ("q", "dat4")]),
@@ -272,6 +304,66 @@ CONTROLS = [
      ["A.5.12"], ["C1.1"],
      [("clause", "sow_data"), ("q", "dat4")]),
 ]
+
+
+# NIST SP 800-53 Rev. 5 mappings for each unified control (many-to-many)
+NIST_MAP = {
+    "UC01": ["SA-4", "SA-9", "SR-3"],
+    "UC02": ["CA-2", "CA-7", "SA-9"],
+    "UC03": ["PS-6"],
+    "UC04": ["PT-2", "PT-3"],
+    "UC05": ["SA-9(5)", "PT-2"],
+    "UC06": ["SR-3", "SR-6", "SA-9"],
+    "UC07": ["IR-4", "IR-6"],
+    "UC08": ["AC-2", "AC-6", "IA-2"],
+    "UC09": ["SC-8", "SC-12", "SC-13", "SC-28"],
+    "UC10": ["MP-6", "SI-12"],
+    "UC11": ["PS-3"],
+    "UC12": ["RA-5", "SI-2", "SI-4"],
+    "UC13": ["CM-3", "CM-4"],
+    "UC14": ["CP-2", "CP-9", "CP-10"],
+    "UC15": ["SA-4", "SR-5"],
+    "UC16": ["SA-9", "SR-6"],
+    "UC17": ["PM-1", "PM-2"],
+    "UC18": ["RA-2", "CM-8"],
+}
+NIST = {
+    "AC-2": "Account management",
+    "AC-6": "Least privilege",
+    "CA-2": "Control assessments",
+    "CA-7": "Continuous monitoring",
+    "CM-3": "Configuration change control",
+    "CM-4": "Impact analyses",
+    "CM-8": "System component inventory",
+    "CP-2": "Contingency plan",
+    "CP-9": "System backup",
+    "CP-10": "System recovery and reconstitution",
+    "IA-2": "Identification and authentication (organizational users)",
+    "IR-4": "Incident handling",
+    "IR-6": "Incident reporting",
+    "MP-6": "Media sanitization",
+    "PM-1": "Information security program plan",
+    "PM-2": "Information security program leadership role",
+    "PS-3": "Personnel screening",
+    "PS-6": "Access agreements",
+    "PT-2": "Authority to process PII",
+    "PT-3": "PII processing purposes",
+    "RA-2": "Security categorization",
+    "RA-5": "Vulnerability monitoring and scanning",
+    "SA-4": "Acquisition process",
+    "SA-9": "External system services",
+    "SA-9(5)": "Processing, storage and service location",
+    "SC-8": "Transmission confidentiality and integrity",
+    "SC-12": "Cryptographic key establishment and management",
+    "SC-13": "Cryptographic protection",
+    "SC-28": "Protection of information at rest",
+    "SI-2": "Flaw remediation",
+    "SI-4": "System monitoring",
+    "SI-12": "Information management and retention",
+    "SR-3": "Supply chain controls and processes",
+    "SR-5": "Acquisition strategies, tools and methods",
+    "SR-6": "Supplier assessments and reviews",
+}
 
 
 # ---- Synthetic sample agreements (NimbusCRM) — deliberate gaps included ----
